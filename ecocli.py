@@ -1,5 +1,10 @@
 import pandas as pd
 import datetime
+import os
+import re
+import requests
+import zoneinfo
+
 
 def load_cicd_data(cicd_csv_path):
     """
@@ -29,12 +34,95 @@ def load_carbon_data(carbon_csv_path):
         "Datetime (UTC)": "datetime_utc",
         "Carbon Intensity gCO₂eq/kWh (direct)": "carbon_intensity"
     }, inplace=True)
-    df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], errors='coerce')
+    df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], errors='coerce', utc="True")
     
     # Fill missing carbon intensity with 400
     df['carbon_intensity'] = df['carbon_intensity'].fillna(400)
     return df
 
+def get_zone_csv_for_location(lat, lon):
+    """
+    1) Makes a request to Electricity Maps for the given lat/lon.
+    2) Parses the error response to extract 'zoneKey'.
+    3) Downloads that zone's 2024 CSV file.
+    4) Loads it into a pandas DataFrame and deletes the file.
+    
+    Returns: A pandas DataFrame of carbon intensity for that zone.
+    """
+    df_zone = None
+    # Download the CSV
+    if lat == 0.0 and lon == 0.0: #If default I just load the average US data
+        df_zone = load_carbon_data("US_2024_hourly.csv")
+    else:
+        # 1) Request zone info from Electricity Maps
+        url = f"https://api.electricitymap.org/v3/carbon-intensity/latest?lat={lat}&lon={lon}"
+        headers = {"auth-token": "DwDd0FXCLfD8W57FToNf"} #This is my personal token
+        try:
+            response = requests.get(url, headers=headers)
+            response_json = response.json()
+        except Exception as e:
+            print("Error during HTTP request:", e)
+            return None
+
+        # 2) Pinging the api with a latlon returns an error, but it also tells us which zone the lat+lon is in
+        # Example error: "Request unauthorized for zoneKey=US-NW-PACW, requestType=latest..."
+        err_msg = response_json.get("error", "")
+        match = re.search(r'zoneKey=([^,]+)', err_msg)
+        if not match:
+            print("Could not parse zoneKey from response:", response_json)
+            return None
+        zone_key = match.group(1)
+        print(f"Detected zone key: {zone_key}")
+
+        # 3) Construct CSV download URL
+        # Example: https://data.electricitymaps.com/2025-01-27/US-NW-PACW_2024_hourly.csv
+        csv_url = f"https://data.electricitymaps.com/2025-01-27/{zone_key}_2024_hourly.csv"
+        tmp_csv = "temp_zone_data.csv"
+
+        try:
+            dl_response = requests.get(csv_url)
+            if dl_response.status_code != 200:
+                print(f"Failed to download CSV for zone {zone_key} (status {dl_response.status_code}).")
+                return None
+
+            with open(tmp_csv, "wb") as f:
+                f.write(dl_response.content)
+        except Exception as e:
+            print("Error downloading CSV:", e)
+            return None
+
+        # 4) Load it into pandas and delete the file
+        try:
+            df_zone = load_carbon_data(tmp_csv) #Load and set the columns
+        finally:
+            os.remove(tmp_csv)
+
+    return df_zone
+
+
+def prompt_for_location_and_download():
+    """
+    Asks the user for latitude & longitude and attempts to download the
+    relevant zone's CSV from electricitymaps.com, returning a DataFrame.
+    """
+    # Example lat/lon prompt
+    lat_str = input("Enter latitude (e.g., 45): ").strip()
+    lon_str = input("Enter longitude (e.g., -123): ").strip()
+
+    # Convert to float
+    try:
+        lat = float(lat_str)
+        lon = float(lon_str)
+    except ValueError:
+        print("Invalid lat/lon, defaulting to some fallback (e.g., 0,0).")
+        lat, lon = 0.0, 0.0
+
+    df_zone = get_zone_csv_for_location(lat, lon)
+    if df_zone is None or df_zone.empty:
+        print("Could not retrieve zone CSV or data is empty.")
+        return None
+    print("Zone CSV loaded successfully!")
+    return df_zone
 
 def get_unique_repos(df_cicd):
     """Return a sorted list of unique repos."""
@@ -61,11 +149,11 @@ def get_average_runtime_hours(df_cicd, repo_name, workflow_name):
     return max(avg_hours, 0.5)  # enforce a minimum of 0.5 hr
 
 def get_user_start_datetime():
-    # Ask user if they want the current UTC time
-    choice = input("Do you want to use the current UTC time? (y/N): ").strip().lower()
+    # Ask user if they want the current time
+    choice = input("Do you want to use the current time? (y/N): ").strip().lower()
 
     if choice.lower() == 'y':
-        start_dt = datetime.datetime.utcnow()
+        start_dt = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=365)
     else:
         try:
             # Prompt user for separate components
@@ -77,11 +165,13 @@ def get_user_start_datetime():
             day = int(day_str)
             hour = int(hour_str)
 
-            # Build a datetime with a fixed year of 2025 (UTC, no minutes/seconds)
-            start_dt = datetime.datetime(2024, month, day, hour)
+            pnw_zone = zoneinfo.ZoneInfo("America/Los_Angeles") #Assuming tz is pnw. Maybe we should get local
+            naive_dt = datetime.datetime(2024, month, day, hour)
+            # Assign the PNW timezone:
+            start_dt = naive_dt.replace(tzinfo=pnw_zone)
         except ValueError:
             print("Invalid date/time input. Falling back to current UTC time.")
-            start_dt = datetime.datetime.utcnow()
+            start_dt = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=365)
 
     print(f"Using start time (UTC): {start_dt}")
     return start_dt
@@ -190,13 +280,16 @@ def main():
         # 4) Ask user for target date (UTC). Default: today
         start_dt = get_user_start_datetime()
 
-        # 5) Retrieve carbon data for next 24 hours
+        # 5) Ask user for location they want to run the operation
+        df_carbon = prompt_for_location_and_download()
+
+        # 6) Retrieve carbon data for next 24 hours
         subset_carbon = get_carbon_data_for_24h(df_carbon, start_dt)
         if subset_carbon.empty:
             print("No carbon data for that date/time range!")
             return
         
-        # 6) Perform sliding window
+        # 7) Perform sliding window
         carbon_series = subset_carbon['carbon_intensity'].reset_index(drop=True)
         best_index, best_sum = find_best_start_time(carbon_series, avg_run_hrs)
         if best_index is None:
@@ -218,12 +311,12 @@ def main():
             job_duration = 1.0  # default 1 hour
 
         # 2) Ask user for location (not used, but we store it for future)
-        location_str = input("Enter job location (currently unused): ").strip()
-        if not location_str:
-            location_str = "USA"
+        df_carbon = prompt_for_location_and_download()
 
-        # 3) Ask user for target date/time
+       # 3) Ask user for target date/time
         start_dt = get_user_start_datetime()
+
+        #Get the correct df_carbon based on the location
 
         # 4) Get carbon data for next 24 hours
         subset_carbon = get_carbon_data_for_24h(df_carbon, start_dt)
