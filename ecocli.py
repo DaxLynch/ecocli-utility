@@ -213,6 +213,34 @@ def find_best_start_time(carbon_series, duration_hours):
         return best_start_index, best_sum
     else:
         return None, None
+    
+def find_worst_start_time(carbon_series, duration_hours):
+    """
+    Given a time-ordered Series of carbon intensities (one value per hour),
+    slide over each possible starting hour, summing over 'duration_hours' hours.
+    
+    NOTE: For simplicity, we assume 'duration_hours' can be rounded up or down
+    to an integer. If you need partial-hour logic, you'll need a more detailed approach.
+    """
+    # Round duration hours to nearest integer for discrete hourly sums
+    dur_hrs = int(round(duration_hours))
+    if dur_hrs <= 0:
+        dur_hrs = 1
+
+    worst_sum = -float('inf')
+    worst_start_index = None
+
+    # We can only slide up to len(carbon_series) - dur_hrs + 1
+    for start_idx in range(0, len(carbon_series) - dur_hrs + 1):
+        window_sum = carbon_series.iloc[start_idx:start_idx + dur_hrs].sum()
+        if window_sum > worst_sum:
+            worst_sum = window_sum
+            worst_start_index = start_idx
+
+    if worst_start_index is not None:
+        return worst_start_index, worst_sum
+    else:
+        return None, None
 
 
 def cli_menu():
@@ -300,6 +328,17 @@ def main():
         best_start_time = subset_carbon.iloc[best_index]['datetime_utc']
         print(f"\nBest Start Time: {best_start_time} UTC")
         print(f"Estimated carbon intensity sum over the window: {best_sum:.2f}")
+        
+        # 7) Get worst time
+        worst_index, worst_sum = find_worst_start_time(carbon_series, avg_run_hrs)
+        if worst_index is None:
+            print("Could not find a valid window.")
+            return
+
+        # 7) The worst start time is the date/time at subset_carbon.iloc[best_index]
+        worst_start_time = subset_carbon.iloc[worst_index]['datetime_utc']
+        print(f"\nWorst Start Time: {worst_start_time} UTC")
+        print(f"Estimated carbon intensity sum: {worst_sum:.2f}")
 
     elif mode == "2":
         # --- Mode 2: Custom job-based ---
@@ -326,6 +365,7 @@ def main():
         
         # 5) Perform sliding window
         carbon_series = subset_carbon['carbon_intensity'].reset_index(drop=True)
+        # Get best time
         best_index, best_sum = find_best_start_time(carbon_series, job_duration)
         if best_index is None:
             print("Could not find a valid window.")
@@ -334,6 +374,15 @@ def main():
         best_start_time = subset_carbon.iloc[best_index]['datetime_utc']
         print(f"\nBest Start Time: {best_start_time} UTC")
         print(f"Estimated carbon intensity sum: {best_sum:.2f}")
+        # Get worst time
+        worst_index, worst_sum = find_worst_start_time(carbon_series, job_duration)
+        if worst_index is None:
+            print("Could not find a valid window.")
+            return
+
+        worst_start_time = subset_carbon.iloc[worst_index]['datetime_utc']
+        print(f"\nWorst Start Time: {worst_start_time} UTC")
+        print(f"Estimated carbon intensity sum: {worst_sum:.2f}")
 
     else:
         print("Invalid mode selected. Exiting.")
