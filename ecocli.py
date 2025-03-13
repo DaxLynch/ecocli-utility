@@ -3,7 +3,11 @@ import datetime
 import os
 import re
 import requests
-import zoneinfo
+from zoneinfo import ZoneInfo
+import json
+
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)  # Ensure directory exists
 
 
 def load_cicd_data(cicd_csv_path):
@@ -42,62 +46,61 @@ def load_carbon_data(carbon_csv_path):
 
 def get_zone_csv_for_location(lat, lon):
     """
-    1) Makes a request to Electricity Maps for the given lat/lon.
-    2) Parses the error response to extract 'zoneKey'.
-    3) Downloads that zone's 2024 CSV file.
-    4) Loads it into a pandas DataFrame and deletes the file.
-    
-    Returns: A pandas DataFrame of carbon intensity for that zone.
+    1) Check if the zone CSV exists locally before making an API request.
+    2) If it exists, load the cached data.
+    3) If not, request the zoneKey and download the corresponding CSV file.
     """
-    df_zone = None
-    # Download the CSV
-    if lat == 0.0 and lon == 0.0: #If default I just load the average US data
-        df_zone = load_carbon_data("US_2024_hourly.csv")
+    if lat == 0.0 and lon == 0.0:
+        csv_filename = os.path.join(DATA_DIR, "US_2024_hourly.csv")
     else:
-        # 1) Request zone info from Electricity Maps
-        url = f"https://api.electricitymap.org/v3/carbon-intensity/latest?lat={lat}&lon={lon}"
-        headers = {"auth-token": "DwDd0FXCLfD8W57FToNf"} #This is my personal token
-        try:
-            response = requests.get(url, headers=headers)
-            response_json = response.json()
-        except Exception as e:
-            print("Error during HTTP request:", e)
+        csv_filename = os.path.join(DATA_DIR, f"{lat}_{lon}_carbon.csv")
+
+    # ✅ Step 1: Check if CSV file already exists
+    if os.path.exists(csv_filename):
+        print(f"📂 Using cached data from {csv_filename}")
+        return load_carbon_data(csv_filename)
+
+    # Step 2: If not cached, fetch data from Electricity Maps API
+    print(f"🌍 Fetching zone data for lat: {lat}, lon: {lon}...")
+
+    url = f"https://api.electricitymap.org/v3/carbon-intensity/latest?lat={lat}&lon={lon}"
+    headers = {"auth-token": "DwDd0FXCLfD8W57FToNf"}  # Personal token
+
+    try:
+        response = requests.get(url, headers=headers)
+        response_json = response.json()
+    except Exception as e:
+        print("❌ Error during HTTP request:", e)
+        return None
+
+    # Step 3: Extract `zoneKey` from API response error message
+    err_msg = response_json.get("error", "")
+    match = re.search(r'zoneKey=([^,]+)', err_msg)
+    if not match:
+        print("❌ Could not determine zoneKey from response:", response_json)
+        return None
+    zone_key = match.group(1)
+    print(f"✅ Detected zone key: {zone_key}")
+
+    # Step 4: Construct CSV download URL
+    csv_url = f"https://data.electricitymaps.com/2025-01-27/{zone_key}_2024_hourly.csv"
+
+    try:
+        dl_response = requests.get(csv_url)
+        if dl_response.status_code != 200:
+            print(f"❌ Failed to download CSV for zone {zone_key} (status {dl_response.status_code}).")
             return None
 
-        # 2) Pinging the api with a latlon returns an error, but it also tells us which zone the lat+lon is in
-        # Example error: "Request unauthorized for zoneKey=US-NW-PACW, requestType=latest..."
-        err_msg = response_json.get("error", "")
-        match = re.search(r'zoneKey=([^,]+)', err_msg)
-        if not match:
-            print("Could not parse zoneKey from response:", response_json)
-            return None
-        zone_key = match.group(1)
-        print(f"Detected zone key: {zone_key}")
+        with open(csv_filename, "wb") as f:
+            f.write(dl_response.content)
+        print(f"✅ Saved {csv_filename} for future use.")
 
-        # 3) Construct CSV download URL
-        # Example: https://data.electricitymaps.com/2025-01-27/US-NW-PACW_2024_hourly.csv
-        csv_url = f"https://data.electricitymaps.com/2025-01-27/{zone_key}_2024_hourly.csv"
-        tmp_csv = "temp_zone_data.csv"
+    except Exception as e:
+        print("❌ Error downloading CSV:", e)
+        return None
 
-        try:
-            dl_response = requests.get(csv_url)
-            if dl_response.status_code != 200:
-                print(f"Failed to download CSV for zone {zone_key} (status {dl_response.status_code}).")
-                return None
-
-            with open(tmp_csv, "wb") as f:
-                f.write(dl_response.content)
-        except Exception as e:
-            print("Error downloading CSV:", e)
-            return None
-
-        # 4) Load it into pandas and delete the file
-        try:
-            df_zone = load_carbon_data(tmp_csv) #Load and set the columns
-        finally:
-            os.remove(tmp_csv)
-
-    return df_zone
+    # Step 5: Load data into pandas
+    return load_carbon_data(csv_filename)
 
 
 def prompt_for_location_and_download():
@@ -165,7 +168,7 @@ def get_user_start_datetime():
             day = int(day_str)
             hour = int(hour_str)
 
-            pnw_zone = zoneinfo.ZoneInfo("America/Los_Angeles") #Assuming tz is pnw. Maybe we should get local
+            pnw_zone = ZoneInfo("America/Los_Angeles") #Assuming tz is pnw. Maybe we should get local
             naive_dt = datetime.datetime(2024, month, day, hour)
             # Assign the PNW timezone:
             start_dt = naive_dt.replace(tzinfo=pnw_zone)
