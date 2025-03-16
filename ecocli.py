@@ -5,6 +5,7 @@ import re
 import requests
 from zoneinfo import ZoneInfo
 import json
+import psycopg2
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)  # Ensure directory exists
@@ -40,47 +41,54 @@ def load_carbon_data(carbon_csv_path):
     }, inplace=True)
     df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], errors='coerce', utc="True")
     
-    # Fill missing carbon intensity with 400
+    # Fill missing carbon intensity with 400. This is a temporary value, should be filled with the average of the data set, or some other interpolation method
     df['carbon_intensity'] = df['carbon_intensity'].fillna(400)
     return df
 
 def get_zone_csv_for_location(lat, lon):
     """
-    1) Check if the zone CSV exists locally before making an API request.
-    2) If it exists, load the cached data.
-    3) If not, request the zoneKey and download the corresponding CSV file.
+    1) If the location is fedault, use the local csv,
+    2) Otherwise find which zone the lat/lon is in by pinging the api
+    3) extracting the zone key from the error response
+    4) Check if CSV file already exists, and if so return that
+    5) Load data into pandas
     """
+    # Step 1: Check if location is default, in that case its already local
     if lat == 0.0 and lon == 0.0:
+        print("Default US carbon data used")
         csv_filename = os.path.join(DATA_DIR, "US_2024_hourly.csv")
-    else:
-        csv_filename = os.path.join(DATA_DIR, f"{lat}_{lon}_carbon.csv")
-
-    # ✅ Step 1: Check if CSV file already exists
-    if os.path.exists(csv_filename):
-        print(f"📂 Using cached data from {csv_filename}")
         return load_carbon_data(csv_filename)
 
-    # Step 2: If not cached, fetch data from Electricity Maps API
-    print(f"🌍 Fetching zone data for lat: {lat}, lon: {lon}...")
+
+    # Step 2: Otherwise fetch zone key from Electricity Maps API
+    print(f"Fetching zone data for lat: {lat}, lon: {lon}...")
 
     url = f"https://api.electricitymap.org/v3/carbon-intensity/latest?lat={lat}&lon={lon}"
-    headers = {"auth-token": "DwDd0FXCLfD8W57FToNf"}  # Personal token
+    headers = {"auth-token": "DwDd0FXCLfD8W57FToNf"}  # This is my personal token
 
     try:
         response = requests.get(url, headers=headers)
         response_json = response.json()
     except Exception as e:
-        print("❌ Error during HTTP request:", e)
+        print("Error during HTTP request:", e)
         return None
 
     # Step 3: Extract `zoneKey` from API response error message
     err_msg = response_json.get("error", "")
     match = re.search(r'zoneKey=([^,]+)', err_msg)
     if not match:
-        print("❌ Could not determine zoneKey from response:", response_json)
+        print("Could not determine zoneKey from response:", response_json)
         return None
     zone_key = match.group(1)
-    print(f"✅ Detected zone key: {zone_key}")
+    print(f"Detected zone key: {zone_key}")
+    csv_filename = None
+
+    csv_filename = os.path.join(DATA_DIR, f"{zone_key}_2024_hourly.csv")
+
+    # Step 4: Check if CSV file already exists, and if so return that
+    if os.path.exists(csv_filename):
+        print(f"📂 Using cached data from {csv_filename}")
+        return load_carbon_data(csv_filename)
 
     # Step 4: Construct CSV download URL
     csv_url = f"https://data.electricitymaps.com/2025-01-27/{zone_key}_2024_hourly.csv"
@@ -88,15 +96,15 @@ def get_zone_csv_for_location(lat, lon):
     try:
         dl_response = requests.get(csv_url)
         if dl_response.status_code != 200:
-            print(f"❌ Failed to download CSV for zone {zone_key} (status {dl_response.status_code}).")
+            print(f"Failed to download CSV for zone {zone_key} (status {dl_response.status_code}).")
             return None
 
         with open(csv_filename, "wb") as f:
             f.write(dl_response.content)
-        print(f"✅ Saved {csv_filename} for future use.")
+        print(f"Saved {csv_filename} for future use.")
 
     except Exception as e:
-        print("❌ Error downloading CSV:", e)
+        print("Error downloading CSV:", e)
         return None
 
     # Step 5: Load data into pandas
@@ -186,7 +194,7 @@ def get_carbon_data_for_24h(df_carbon, start_dt):
     end_dt = start_dt + datetime.timedelta(hours=24)
     mask = (df_carbon['datetime_utc'] >= start_dt) & (df_carbon['datetime_utc'] < end_dt)
     subset = df_carbon[mask].sort_values(by='datetime_utc')
-    print(subset)
+    #print(subset)
     return subset
 
 def find_best_start_time(carbon_series, duration_hours):
@@ -255,15 +263,15 @@ def cli_menu():
     print("Welcome to the CI/CD Carbon-Aware Scheduler!")
     print("[1] Workflow-Based Recommendation (Historical CI/CD Data)")
     print("[2] Custom Job-Based Recommendation")
-    mode = input("Select a mode (1 or 2): ").strip()
+    print("[3] Sync local SQL Database")
+    mode = input("Select a mode (1, 2 or 3): ").strip()
 
     return mode
 
 
 def main():
     # Load data
-    df_cicd = load_cicd_data("cicdOps.csv")
-    df_carbon = load_carbon_data("US_2024_hourly.csv")
+    df_cicd = load_cicd_data("data/cicdOps.csv")
 
     # Prompt user for mode
     mode = cli_menu()
@@ -386,6 +394,22 @@ def main():
         worst_start_time = subset_carbon.iloc[worst_index]['datetime_utc']
         print(f"\nWorst Start Time: {worst_start_time} UTC")
         print(f"Estimated carbon intensity sum: {worst_sum:.2f}")
+
+    elif mode == "3":
+        dbname = input("What is the database name? ").strip()
+        user = input("What is the username? ").strip()
+        password = input("What is the password? ")
+        host = input("What is the host IP? ").strip()
+        port = input("What is the port? ").strip()
+        conn = psycopg2.connect(
+            dbname=dbname,
+            user=user,
+            password=password,
+            host=host,
+            port=port
+        )
+        df = pd.read_sql("SELECT * FROM api.environmental_data", conn)
+        df.to_csv("data/cicdOps.csv", index=False)
 
     else:
         print("Invalid mode selected. Exiting.")
